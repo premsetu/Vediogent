@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
 """
-make_video.py — Standalone cinematic video generator.
+make_video.py v2 — Cinematic video generator with prompt + YouTube concept replication
 
-Produces a dark-background, text-card style cinematic video from the user's
-script using gTTS narration and FFmpeg visuals. No external API keys needed.
+Usage:
+  python make_video.py --script script.txt
+  python make_video.py --script script.txt --prompt "dark cinematic epic"
+  python make_video.py --script script.txt --ref-url "https://youtu.be/VIDEO_ID"
+  python make_video.py --script script.txt --prompt "energetic" --ref-url URL --voice edge:en-US-GuyNeural
 
-Usage: python make_video.py
+Options:
+  --script  TEXT or path to .txt/.md file
+  --prompt  Style: "dark cinematic", "epic energetic", "minimal clean", "blue tech" …
+  --ref-url YouTube URL — analyse transcript + thumbnail → replicate pacing & palette
+  --voice   TTS engine: edge:VoiceName (default) | gtts:lang
+  --output  Output directory  (default: out/video_<timestamp>)
+  --force   Regenerate all clips even if cached
 """
-
+import argparse
+import asyncio
 import json
 import os
 import re
@@ -15,370 +25,683 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
+import urllib.request
+import urllib.parse
+import wave
 from pathlib import Path
+from typing import Optional
 
-# ── Static FFmpeg ─────────────────────────────────────────────────────────────
+# ── static FFmpeg ─────────────────────────────────────────────────────────────
 import static_ffmpeg
 static_ffmpeg.add_paths()
 
-# ── gTTS ──────────────────────────────────────────────────────────────────────
-from gtts import gTTS
+# ── imaging ───────────────────────────────────────────────────────────────────
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from pydub import AudioSegment
+from gtts import gTTS
+import numpy as np
+
+# ── yt-dlp (stub broken secretstorage before import) ─────────────────────────
+import types as _types
+_ss = _types.ModuleType("secretstorage")
+sys.modules.setdefault("secretstorage", _ss)
+import yt_dlp  # noqa: E402
 
 # ─────────────────────────────────────────────────────────────────────────────
-SCRIPT = """
-You live a normal life.
-
-You wake up, you work, you scroll, you sleep — and you do it all over again.
-And there's nothing wrong with that. But have you ever stopped and asked yourself — why is that?
-
-Why do some people just seem to know more? Live better? Move differently? While the rest of us stay... normal.
-
-Here's the truth. The people who live exceptional lives aren't built differently. They just know things most people never learn. Things school never taught you. Things nobody around you ever sat down and explained.
-
-And that's exactly why this channel exists.
-
-To help with that, we're starting a series — where we cover the ten things you must know to step out of normal, and into the exceptional one percent.
-
-And we're not staying in one lane. We're covering everything. Finance. Technology. Psychology. Health. Mindset. The world. Everything that makes your life better, and your knowledge exceptional.
-
-Because being exceptional isn't about one skill. It's about understanding how the whole world actually works — and using that to your advantage.
-
-So this is an invitation. Follow us. Be with us on this journey. Every video, we go one step deeper. One topic at a time. One thing closer to the kind of life you actually want.
-
-Subscribe, turn on notifications, and let's begin. Because the gap between normal and exceptional? It's just knowledge. And we're about to close it.
-"""
-
 W, H = 1920, 1080
-FPS = 30
-SILENCE_MS = 200   # ms between beats
-OUT_DIR = Path("out/cinematic_intro")
+FPS  = 30
+FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+SILENCE_MS = 180
+
+# ── Visual style presets ──────────────────────────────────────────────────────
+STYLES = {
+    "dark-epic": {
+        "bg":      (6,  8,  18),
+        "bloom":   (28, 14, 55),
+        "text":    (255, 255, 255),
+        "accent":  (160, 110, 255),
+        "caption_primary": "&H00FFFFFF",
+        "caption_back":    "&H90000000",
+        "vignette": 210,
+    },
+    "dark-cinematic": {
+        "bg":      (5, 5, 5),
+        "bloom":   (18, 12, 28),
+        "text":    (238, 232, 212),
+        "accent":  (210, 165, 70),
+        "caption_primary": "&H00EEE8D4",
+        "caption_back":    "&H90000000",
+        "vignette": 220,
+    },
+    "blue-tech": {
+        "bg":      (4, 12, 28),
+        "bloom":   (0,  35, 75),
+        "text":    (200, 230, 255),
+        "accent":  (0,  180, 255),
+        "caption_primary": "&H00C8E6FF",
+        "caption_back":    "&H90000000",
+        "vignette": 175,
+    },
+    "warm-gold": {
+        "bg":      (10, 7, 3),
+        "bloom":   (35, 22, 5),
+        "text":    (255, 248, 225),
+        "accent":  (220, 168, 38),
+        "caption_primary": "&H00FFF8E1",
+        "caption_back":    "&H90000000",
+        "vignette": 200,
+    },
+    "minimal-light": {
+        "bg":      (248, 248, 248),
+        "bloom":   (220, 220, 235),
+        "text":    (22, 22, 32),
+        "accent":  (70, 70, 200),
+        "caption_primary": "&H00161620",
+        "caption_back":    "&H90FFFFFF",
+        "vignette": 55,
+    },
+}
+
+_PROMPT_MAP = {
+    "dark": "dark-epic", "epic": "dark-epic", "dramatic": "dark-epic",
+    "cinematic": "dark-cinematic", "film": "dark-cinematic", "movie": "dark-cinematic",
+    "tech": "blue-tech", "technology": "blue-tech", "future": "blue-tech", "neon": "blue-tech",
+    "gold": "warm-gold", "luxury": "warm-gold", "wealth": "warm-gold", "warm": "warm-gold",
+    "minimal": "minimal-light", "clean": "minimal-light", "simple": "minimal-light",
+    "white": "minimal-light",
+}
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+def style_from_prompt(prompt: str) -> dict:
+    if not prompt:
+        return dict(STYLES["dark-epic"], name="dark-epic")
+    pl = prompt.lower()
+    for kw, preset in _PROMPT_MAP.items():
+        if kw in pl:
+            return dict(STYLES[preset], name=preset)
+    return dict(STYLES["dark-epic"], name="dark-epic")
 
-def run(cmd, check=True, **kw):
-    result = subprocess.run(cmd, capture_output=True, text=True, **kw)
-    if check and result.returncode != 0:
-        raise RuntimeError(f"Command failed: {' '.join(str(c) for c in cmd)}\n{result.stderr[-2000:]}")
+
+# ── YouTube analysis ──────────────────────────────────────────────────────────
+
+def analyze_youtube(url: str, work_dir: Path) -> dict:
+    """
+    Download auto-captions + thumbnail from YouTube.
+    Returns style parameters derived from pacing + color palette.
+    """
+    print(f"  fetching YouTube metadata…")
+    ref_dir = work_dir / "ref"
+    ref_dir.mkdir(parents=True, exist_ok=True)
+
+    ydl_opts = {
+        "writeautomaticsub": True,
+        "subtitleslangs": ["en"],
+        "writesubtitles": False,
+        "writethumbnail": True,
+        "skip_download": True,
+        "subtitlesformat": "vtt",
+        "outtmpl": str(ref_dir / "%(id)s.%(ext)s"),
+        "quiet": True,
+        "no_warnings": True,
+    }
+
+    info = {}
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True) or {}
+    except Exception as e:
+        print(f"  [warn] yt-dlp error: {e}")
+
+    result = {
+        "title": info.get("title", ""),
+        "description": info.get("description", "")[:500],
+        "duration": info.get("duration", 0),
+        "avg_segment_dur": 5.0,
+        "pacing": "medium",
+        "style_preset": "dark-epic",
+        "bg_override": None,
+        "accent_override": None,
+    }
+
+    # Parse VTT for pacing
+    vtt_files = list(ref_dir.glob("*.vtt"))
+    if vtt_files:
+        pacing = _parse_vtt_pacing(vtt_files[0])
+        result.update(pacing)
+
+    # Analyse thumbnail for palette
+    thumb_exts = ["*.jpg", "*.jpeg", "*.webp", "*.png"]
+    thumbs = []
+    for ext in thumb_exts:
+        thumbs.extend(ref_dir.glob(ext))
+    if thumbs:
+        palette = _thumbnail_palette(thumbs[0])
+        result.update(palette)
+
+    print(f"  → pacing={result['pacing']}, style={result['style_preset']}, "
+          f"title={result['title'][:40]!r}")
     return result
 
 
-def parse_beats(script: str) -> list[str]:
-    paras = [p.strip() for p in re.split(r"\n\s*\n", script.strip())]
-    return [p for p in paras if p]
+def _parse_vtt_pacing(vtt_path: Path) -> dict:
+    text = vtt_path.read_text(encoding="utf-8", errors="ignore")
+    ts_re = re.compile(r"(\d{2}:\d{2}:\d{2}[.,]\d{3}) --> (\d{2}:\d{2}:\d{2}[.,]\d{3})")
+
+    def to_sec(s):
+        s = s.replace(",", ".")
+        h, m, sec = s.split(":")
+        return int(h) * 3600 + int(m) * 60 + float(sec)
+
+    durs = []
+    for m in ts_re.finditer(text):
+        d = to_sec(m.group(2)) - to_sec(m.group(1))
+        if 0.5 < d < 20:
+            durs.append(d)
+
+    if not durs:
+        return {}
+
+    avg = sum(durs) / len(durs)
+    return {
+        "avg_segment_dur": round(avg, 1),
+        "pacing": "fast" if avg < 3.5 else "slow" if avg > 9 else "medium",
+    }
 
 
-def synthesize_beat(text: str, out_path: Path):
-    """Generate TTS MP3 via gTTS, convert to WAV."""
-    mp3_path = out_path.with_suffix(".mp3")
-    tts = gTTS(text=text, lang="en", tld="com", slow=False)
-    tts.save(str(mp3_path))
-
-    # Convert MP3 → WAV (16-bit, 44100Hz) for consistent processing
-    seg = AudioSegment.from_mp3(str(mp3_path))
-    seg = seg.set_frame_rate(44100).set_channels(1).set_sample_width(2)
-    seg.export(str(out_path), format="wav")
-    mp3_path.unlink(missing_ok=True)
-    return len(seg) / 1000.0   # duration in seconds
-
-
-def get_duration(wav_path: Path) -> float:
-    result = run(["ffprobe", "-v", "quiet", "-show_entries",
-                  "format=duration", "-of", "csv=p=0", str(wav_path)])
-    return float(result.stdout.strip())
-
-
-def wrap_text(text: str, max_chars: int = 38) -> str:
-    """Wrap text for on-screen display."""
-    return "\n".join(textwrap.wrap(text, width=max_chars))
-
-
-def escape_ffmpeg_text(s: str) -> str:
-    """Escape special characters for FFmpeg drawtext."""
-    return s.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:").replace("%", "\\%")
-
-
-FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-BG_COLOR = (8, 12, 20)          # dark navy black
-TEXT_COLOR = (255, 255, 255)     # white
-ACCENT_COLOR = (180, 160, 255)   # soft purple accent for first line
-
-
-def _render_beat_frame(beat_text: str, frame_path: Path):
-    """Render a 1920x1080 PNG frame for a beat using Pillow."""
-    from PIL import Image, ImageDraw, ImageFont, ImageFilter
-    import math
-
-    img = Image.new("RGB", (W, H), BG_COLOR)
-    draw = ImageDraw.Draw(img)
-
-    # Vignette: dark corners
-    vignette = Image.new("L", (W, H), 0)
-    v_draw = ImageDraw.Draw(vignette)
-    for i in range(60):
-        alpha = int(180 * (1 - i / 60))
-        v_draw.rectangle([i, i, W - i, H - i], outline=alpha)
-    vignette = vignette.filter(ImageFilter.GaussianBlur(40))
-    vignette_rgb = Image.new("RGB", (W, H), (0, 0, 0))
-    img = Image.composite(img, vignette_rgb, vignette)
-    draw = ImageDraw.Draw(img)
-
-    # Load fonts
+def _thumbnail_palette(thumb_path: Path) -> dict:
     try:
-        font_large = ImageFont.truetype(FONT, 72)
-        font_small = ImageFont.truetype(FONT, 58)
+        img = Image.open(str(thumb_path)).convert("RGB").resize((120, 68))
+        arr = np.array(img).reshape(-1, 3).astype(float)
+
+        # K-means-like: quantise to 8-cube buckets, find most common
+        quant = (arr // 32).astype(int)
+        buckets: dict = {}
+        for row in quant:
+            k = tuple(row)
+            buckets[k] = buckets.get(k, 0) + 1
+
+        top = sorted(buckets.items(), key=lambda x: -x[1])[:6]
+        # Convert bucket centres back to RGB
+        palette = [tuple(int((v * 32) + 16) for v in k) for k, _ in top]
+
+        brightness = float(arr.mean()) / 255.0
+
+        # Heuristic style selection from palette brightness
+        if brightness < 0.22:
+            preset = "dark-cinematic"
+        elif brightness < 0.40:
+            preset = "dark-epic"
+        elif brightness > 0.68:
+            preset = "minimal-light"
+        else:
+            preset = "blue-tech"
+
+        # Warm-tone override
+        if palette:
+            r, g, b = palette[0]
+            if r > g * 1.35 and r > b * 1.6:
+                preset = "warm-gold"
+
+        # Use palette[0] as bg, palette[1] as bloom
+        bg_ovr = palette[0] if palette else None
+        bloom_ovr = palette[1] if len(palette) > 1 else None
+
+        return {
+            "style_preset": preset,
+            "bg_override": bg_ovr,
+            "accent_override": bloom_ovr,
+            "brightness": round(brightness, 2),
+        }
+    except Exception as e:
+        print(f"  [warn] thumbnail analysis failed: {e}")
+        return {}
+
+
+def apply_yt_analysis(style: dict, analysis: dict, prompt: str) -> dict:
+    """Merge YouTube-derived colours/preset into the style dict."""
+    style = dict(style)
+
+    # Only override preset if prompt doesn't already specify a strong direction
+    strong_prompt = any(k in prompt.lower() for k in _PROMPT_MAP)
+    if not strong_prompt and analysis.get("style_preset"):
+        base = STYLES.get(analysis["style_preset"], STYLES["dark-epic"])
+        style.update(base)
+        style["name"] = analysis["style_preset"]
+
+    # Apply extracted colours
+    if analysis.get("bg_override"):
+        style["bg"]    = analysis["bg_override"]
+    if analysis.get("accent_override"):
+        style["bloom"] = analysis["accent_override"]
+
+    return style
+
+
+# ── Background generation ─────────────────────────────────────────────────────
+
+def _make_gradient_img(style: dict, seed: int) -> Image.Image:
+    """
+    Generate a 2304x1296 gradient image (20 % larger than 1920x1080)
+    so zoompan has room to drift without hitting edges.
+    """
+    iw, ih = 2304, 1296
+    img = Image.new("RGB", (iw, ih), style["bg"])
+    arr = np.zeros((ih, iw, 3), dtype=np.float32)
+
+    bg = np.array(style["bg"],   dtype=np.float32)
+    bl = np.array(style["bloom"], dtype=np.float32)
+
+    # Radial gradient: bloom at centre, bg at edges
+    cy, cx = ih / 2, iw / 2
+    Y, X = np.mgrid[0:ih, 0:iw]
+    dist = np.sqrt(((X - cx) / iw) ** 2 + ((Y - cy) / ih) ** 2)
+    dist = np.clip(dist * 2.0, 0, 1)[..., np.newaxis]   # 0=centre, 1=edge
+
+    arr = bg * dist + bl * (1 - dist)
+
+    # Subtle noise texture for depth
+    rng = np.random.default_rng(seed)
+    noise = rng.integers(-6, 7, (ih, iw, 3), dtype=np.int16)
+    arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
+
+    return Image.fromarray(arr, "RGB")
+
+
+# ── Text frame rendering ──────────────────────────────────────────────────────
+
+def _vignette(img: Image.Image, strength: int) -> Image.Image:
+    mask = Image.new("L", img.size, 255)
+    draw = ImageDraw.Draw(mask)
+    steps = 90
+    for i in range(steps):
+        alpha = int(strength * (1 - i / steps) ** 1.8)
+        draw.rectangle([i, i, img.width - i - 1, img.height - i - 1], outline=alpha)
+    mask = mask.filter(ImageFilter.GaussianBlur(55))
+    black = Image.new("RGB", img.size, (0, 0, 0))
+    return Image.composite(black, img, mask)
+
+
+def render_frame(text: str, style: dict, beat_idx: int, out_path: Path) -> Path:
+    """
+    Render 1920x1080 frame: gradient bg cropped from 2304x1296 + vignette + text.
+    Saves PNG, returns path.
+    """
+    bg_img = _make_gradient_img(style, seed=beat_idx)
+    # Centre-crop to 1920x1080 for the static frame
+    left = (2304 - W) // 2
+    top  = (1296 - H) // 2
+    frame = bg_img.crop((left, top, left + W, top + H))
+    frame = _vignette(frame, style.get("vignette", 200))
+
+    draw = ImageDraw.Draw(frame)
+
+    # Font sizes
+    try:
+        f84 = ImageFont.truetype(FONT_BOLD, 84)
+        f72 = ImageFont.truetype(FONT_BOLD, 72)
+        f60 = ImageFont.truetype(FONT_BOLD, 60)
+        f50 = ImageFont.truetype(FONT_BOLD, 50)
     except Exception:
-        font_large = ImageFont.load_default()
-        font_small = font_large
+        f84 = f72 = f60 = f50 = ImageFont.load_default()
 
-    # Wrap and layout text
-    lines = textwrap.wrap(beat_text, width=38)
-    if not lines:
-        img.save(str(frame_path))
-        return
+    words = text.split()
+    is_punchy = len(words) <= 10
+    max_chars = 28 if is_punchy else 40
+    lines = textwrap.wrap(text, width=max_chars)
 
-    # Choose font based on line count
-    font = font_small if len(lines) > 3 else font_large
-    line_h = 90 if len(lines) <= 3 else 75
+    if len(lines) == 1:
+        font, lh = f84, 108
+    elif len(lines) <= 2:
+        font, lh = f72, 95
+    elif len(lines) <= 4:
+        font, lh = f60, 80
+    else:
+        font, lh = f50, 68
 
-    # Measure total block height
-    total_h = len(lines) * line_h
-    y = max(80, (H - total_h) // 2 - 20)
+    total_h = len(lines) * lh
+    y = max(90, (H - total_h) // 2 - 20)
 
-    # Draw each line
+    # Accent rule above text (not on first beat)
+    if beat_idx > 0 and is_punchy:
+        ax, aw = W // 2 - 50, 100
+        draw.rectangle([ax, y - 28, ax + aw, y - 23], fill=style["accent"])
+
     for i, line in enumerate(lines):
         bbox = draw.textbbox((0, 0), line, font=font)
-        text_w = bbox[2] - bbox[0]
-        x = (W - text_w) // 2
+        tw = bbox[2] - bbox[0]
+        x  = (W - tw) // 2
 
-        # Shadow
-        draw.text((x + 4, y + 4), line, font=font, fill=(0, 0, 0, 180))
-        draw.text((x + 2, y + 2), line, font=font, fill=(0, 0, 0))
+        # Drop shadow (3 layers)
+        for ox, oy in [(5, 5), (3, 3), (2, 2)]:
+            draw.text((x + ox, y + oy), line, font=font, fill=(0, 0, 0))
 
-        # Text colour — first line gets accent treatment if short
-        color = ACCENT_COLOR if i == 0 and len(lines) == 1 else TEXT_COLOR
+        color = style["accent"] if (i == 0 and len(lines) == 1) else style["text"]
         draw.text((x, y), line, font=font, fill=color)
+        y += lh
 
-        y += line_h
+    frame.save(str(out_path))
+    return out_path
 
-    img.save(str(frame_path))
 
+# ── Beat video: animated bg + text overlay + fade ────────────────────────────
 
-def make_beat_video(beat_text: str, duration: float, out_path: Path, index: int):
+def make_beat_video(text: str, duration: float, style: dict,
+                    beat_idx: int, out_path: Path):
     """
-    Render a single beat as a 1920x1080 cinematic dark video card.
-    Uses Pillow for text rendering → FFmpeg for video encoding with fade.
+    Produce a video card for one beat:
+      • Large gradient BG → zoompan drift (cinematic floating feel)
+      • Text frame overlaid with fade-in / fade-out
     """
-    frame_path = out_path.with_suffix(".png")
-    _render_beat_frame(beat_text, frame_path)
+    text_png  = out_path.with_name(out_path.stem + "_txt.png")
+    bg_png    = out_path.with_name(out_path.stem + "_bg.png")
 
-    fade_dur = max(0.3, min(0.5, duration * 0.12))
-    fade_out_start = max(0.0, duration - fade_dur)
+    # 1. Text frame (1920×1080)
+    render_frame(text, style, beat_idx, text_png)
 
-    run([
+    # 2. Large gradient (2304×1296) — zoompan will drift inside it
+    bg_img = _make_gradient_img(style, seed=beat_idx)
+    bg_img.save(str(bg_png))
+
+    fade_d     = max(0.3, min(0.45, duration * 0.12))
+    fade_out_s = max(0.1, duration - fade_d)
+    n_frames   = int(duration * FPS) + 5   # zoompan d= param
+
+    # Slow sinusoidal drift parameters (vary by beat for variety)
+    period_z = 9  + (beat_idx % 3) * 2        # zoom period (s)
+    period_x = 11 + (beat_idx % 4)            # horizontal period
+    period_y = 8  + (beat_idx % 3)            # vertical period
+    amp_z    = 0.025 + 0.01 * (beat_idx % 3)
+    amp_x    = 18 + 5 * (beat_idx % 3)
+    amp_y    = 10 + 4 * (beat_idx % 3)
+
+    # zoompan expression (on = output frame number)
+    zp_z = f"1.05+{amp_z}*sin(6.2832*on/({FPS}*{period_z}))"
+    zp_x = f"iw/2-(iw/zoom/2)+{amp_x}*sin(6.2832*on/({FPS}*{period_x}))"
+    zp_y = f"ih/2-(ih/zoom/2)+{amp_y}*sin(6.2832*on/({FPS}*{period_y}))"
+
+    # filter_complex:
+    #   [0] large bg  → zoompan drift  → [bg]
+    #   [1] text frame → fade in/out   → [txt]
+    #   [bg][txt]overlay → [out]
+    fc = (
+        f"[0:v]scale=2304:1296,format=yuv420p,"
+        f"zoompan=z='{zp_z}':x='{zp_x}':y='{zp_y}':d={n_frames}:s={W}x{H}:fps={FPS}[bg];"
+        f"[1:v]scale={W}:{H},format=yuva420p,"
+        f"fade=t=in:st=0:d={fade_d}:alpha=1,"
+        f"fade=t=out:st={fade_out_s}:d={fade_d}:alpha=1[txt];"
+        f"[bg][txt]overlay=0:0[out]"
+    )
+
+    _run([
         "ffmpeg", "-y",
-        "-loop", "1",
-        "-i", str(frame_path),
+        "-loop", "1", "-i", str(bg_png),     # [0]: large bg
+        "-loop", "1", "-i", str(text_png),   # [1]: text
         "-t", str(duration),
-        "-vf", (
-            f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
-            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black,"
-            f"format=yuv420p,"
-            f"fade=t=in:st=0:d={fade_dur},"
-            f"fade=t=out:st={fade_out_start}:d={fade_dur}"
-        ),
-        "-r", str(FPS),
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-        "-an",
+        "-filter_complex", fc,
+        "-map", "[out]",
+        "-r", str(FPS), "-t", str(duration),
+        "-c:v", "libx264", "-preset", "fast", "-crf", "17",
+        "-pix_fmt", "yuv420p", "-an",
         str(out_path),
     ])
 
+    text_png.unlink(missing_ok=True)
+    bg_png.unlink(missing_ok=True)
 
-def concat_wavs(wav_paths: list, silence_ms: int, out_path: Path):
-    """Concatenate WAVs with silence between them."""
+
+# ── TTS ───────────────────────────────────────────────────────────────────────
+
+async def _edge_tts(text: str, voice: str, mp3_path: Path):
+    import edge_tts
+    comm = edge_tts.Communicate(text, voice)
+    await comm.save(str(mp3_path))
+
+
+def synthesize(text: str, voice_spec: str, out_wav: Path) -> float:
+    backend, _, vid = voice_spec.partition(":")
+
+    if backend == "edge":
+        voice = vid or "en-US-GuyNeural"
+        mp3 = out_wav.with_suffix(".mp3")
+        try:
+            asyncio.run(_edge_tts(text, voice, mp3))
+            seg = AudioSegment.from_mp3(str(mp3)).set_frame_rate(44100).set_channels(1)
+            seg.export(str(out_wav), format="wav")
+            mp3.unlink(missing_ok=True)
+            return len(seg) / 1000.0
+        except Exception as e:
+            print(f"  [warn] edge-tts failed ({e}), falling back to gTTS")
+
+    # gTTS fallback — always use lang code, not a voice ID
+    lang = vid if backend == "gtts" else "en"
+    mp3 = out_wav.with_suffix(".mp3")
+    gTTS(text=text, lang=lang, slow=False).save(str(mp3))
+    seg = AudioSegment.from_mp3(str(mp3)).set_frame_rate(44100).set_channels(1)
+    seg.export(str(out_wav), format="wav")
+    mp3.unlink(missing_ok=True)
+    return len(seg) / 1000.0
+
+
+def wav_duration(path: Path) -> float:
+    with wave.open(str(path), "rb") as w:
+        return w.getnframes() / w.getframerate()
+
+
+def concat_wavs(paths: list, silence_ms: int, out: Path) -> float:
     combined = AudioSegment.empty()
-    silence = AudioSegment.silent(duration=silence_ms)
-    for i, p in enumerate(wav_paths):
-        seg = AudioSegment.from_wav(str(p))
-        combined += seg
-        if i < len(wav_paths) - 1:
-            combined += silence
-    combined.export(str(out_path), format="wav")
+    sil = AudioSegment.silent(duration=silence_ms)
+    for i, p in enumerate(paths):
+        combined += AudioSegment.from_wav(str(p))
+        if i < len(paths) - 1:
+            combined += sil
+    combined.export(str(out), format="wav")
     return len(combined) / 1000.0
 
 
-def concat_videos(video_paths: list, out_path: Path):
+def concat_videos(paths: list, out: Path):
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
-        for p in video_paths:
+        for p in paths:
             f.write(f"file '{Path(p).resolve()}'\n")
-        concat_file = f.name
+        cfile = f.name
+    _run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", cfile,
+          "-c", "copy", str(out)])
+    Path(cfile).unlink(missing_ok=True)
 
-    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
-         "-c", "copy", str(out_path)])
-    Path(concat_file).unlink(missing_ok=True)
 
+# ── ASS Captions ──────────────────────────────────────────────────────────────
 
-def build_ass_captions(beats: list, style: str = "bold-pop") -> str:
-    """
-    Build ASS subtitle file from beat timing.
-    Each beat's text is shown word-by-word using karaoke tags.
-    """
-    header = f"""\
-[Script Info]
-ScriptType: v4.00+
-PlayResX: {W}
-PlayResY: {H}
-Timer: 100.0000
+def build_ass(beats: list, style: dict) -> str:
+    pri  = style.get("caption_primary", "&H00FFFFFF")
+    back = style.get("caption_back",    "&H90000000")
 
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,52,&H00FFFFFF,&H00FFFF00,&H00000000,&H90000000,1,0,0,0,100,100,0,0,1,3,2,2,40,40,80,1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
+    header = (
+        "[Script Info]\nScriptType: v4.00+\n"
+        f"PlayResX: {W}\nPlayResY: {H}\nTimer: 100.0000\n\n"
+        "[V4+ Styles]\n"
+        "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,"
+        "OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,"
+        "ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,"
+        "Alignment,MarginL,MarginR,MarginV,Encoding\n"
+        f"Style: Default,Arial,50,{pri},&H00FFFF00,&H00000000,{back},"
+        f"1,0,0,0,100,100,0,0,1,3,2,2,40,40,85,1\n\n"
+        "[Events]\n"
+        "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n"
+    )
 
     def ts(sec):
-        h = int(sec // 3600)
-        m = int((sec % 3600) // 60)
-        s = sec % 60
-        cs = int((s % 1) * 100)
-        return f"{h}:{m:02d}:{int(s):02d}.{cs:02d}"
+        h = int(sec // 3600); m = int((sec % 3600) // 60); s = sec % 60
+        return f"{h}:{m:02d}:{int(s):02d}.{int((s % 1) * 100):02d}"
 
     events = []
-    for beat in beats:
-        words = beat["text"].split()
+    for b in beats:
+        words = b["text"].split()
         if not words:
             continue
-        beat_dur = beat["end"] - beat["start"]
-        word_dur = beat_dur / len(words)
-
-        # Group into lines of ≤6 words
-        for chunk_start in range(0, len(words), 6):
-            chunk = words[chunk_start: chunk_start + 6]
-            line_start = beat["start"] + chunk_start * word_dur
-            line_end = line_start + len(chunk) * word_dur
-
-            # Build karaoke tags
-            text = ""
-            for w in chunk:
-                dur_cs = max(1, int(word_dur * 100))
-                text += f"{{\\k{dur_cs}}}{w} "
-            text = text.strip()
-            events.append(
-                f"Dialogue: 0,{ts(line_start)},{ts(line_end)},"
-                f"Default,,0,0,0,,{text}"
-            )
+        wdur = (b["end"] - b["start"]) / len(words)
+        for chunk_start in range(0, len(words), 7):
+            chunk = words[chunk_start: chunk_start + 7]
+            ls = b["start"] + chunk_start * wdur
+            le = ls + len(chunk) * wdur
+            kara = " ".join(f"{{\\k{max(1, int(wdur * 100))}}}{w}" for w in chunk)
+            events.append(f"Dialogue: 0,{ts(ls)},{ts(le)},Default,,0,0,0,,{kara}")
 
     return header + "\n".join(events) + "\n"
 
 
-def add_subtle_music(narration_wav: Path, out_path: Path, total_dur: float):
-    """
-    If no music file is available, just copy narration as the audio track.
-    """
-    # Just use the narration directly — can add music file later
-    import shutil
-    shutil.copy(str(narration_wav), str(out_path))
+# ── Utilities ─────────────────────────────────────────────────────────────────
+
+def _run(cmd, check=True):
+    r = subprocess.run([str(c) for c in cmd], capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"FFmpeg error:\n{r.stderr[-2500:]}")
+    return r
 
 
-def mux_master(video_track: Path, audio_track: Path, ass_path: Path, out_path: Path):
-    """Mux video + audio + burned captions → master.mp4"""
-    run([
-        "ffmpeg", "-y",
-        "-i", str(video_track),
-        "-i", str(audio_track),
-        "-map", "0:v", "-map", "1:a",
-        "-vf", f"ass={ass_path}",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k",
-        "-movflags", "+faststart",
-        "-shortest",
-        str(out_path),
-    ])
+def parse_beats(text: str) -> list[str]:
+    return [p.strip() for p in re.split(r"\n\s*\n", text.strip()) if p.strip()]
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    beats_dir = OUT_DIR / "beats"
+    ap = argparse.ArgumentParser(
+        description="Cinematic video generator — prompt + YouTube concept replication",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    ap.add_argument("--script",   help="Script text or path to .txt/.md file")
+    ap.add_argument("--prompt",   default="dark epic cinematic",
+                    help="Style prompt: dark / cinematic / epic / tech / gold / minimal …")
+    ap.add_argument("--ref-url",  dest="ref_url",
+                    help="YouTube URL to analyse and replicate (pacing + colour palette)")
+    ap.add_argument("--voice",    default="edge:en-US-GuyNeural",
+                    help="TTS: edge:VoiceName  or  gtts:lang  (default: edge:en-US-GuyNeural)")
+    ap.add_argument("--output",   default=f"out/video_{int(time.time())}",
+                    help="Output directory")
+    ap.add_argument("--force",    action="store_true",
+                    help="Regenerate all clips even if cached")
+    args = ap.parse_args()
+
+    # ── Read script ───────────────────────────────────────────────────────────
+    if not args.script:
+        if sys.stdin.isatty():
+            ap.error("Provide --script or pipe script text via stdin.")
+        script_text = sys.stdin.read()
+    elif Path(args.script).exists():
+        script_text = Path(args.script).read_text(encoding="utf-8")
+    else:
+        script_text = args.script   # treat as inline text
+
+    out_dir    = Path(args.output)
+    beats_dir  = out_dir / "beats"
+    out_dir.mkdir(parents=True, exist_ok=True)
     beats_dir.mkdir(exist_ok=True)
 
-    beat_texts = parse_beats(SCRIPT)
-    print(f"Script: {len(beat_texts)} beats")
+    # ── Style resolution ──────────────────────────────────────────────────────
+    style = style_from_prompt(args.prompt)
+    print(f"Prompt style: {style['name']}")
 
-    # Stage 1 — TTS per beat
+    # ── YouTube analysis ──────────────────────────────────────────────────────
+    yt_analysis = {}
+    if args.ref_url:
+        print("\n▶ youtube-analysis")
+        try:
+            yt_analysis = analyze_youtube(args.ref_url, out_dir)
+            style = apply_yt_analysis(style, yt_analysis, args.prompt)
+            print(f"  Final style after YT merge: {style.get('name')}")
+        except Exception as e:
+            print(f"  [warn] YouTube analysis failed: {e}")
+
+    beat_texts = parse_beats(script_text)
+    print(f"\nScript: {len(beat_texts)} beats  |  style: {style.get('name')}")
+
+    # ── Narrate ───────────────────────────────────────────────────────────────
     print("\n▶ narrate")
     beats = []
     cumulative = 0.0
-    beat_wavs = []
+    beat_wavs  = []
 
     for i, text in enumerate(beat_texts):
-        wav_path = beats_dir / f"beat_{i:03d}.wav"
-        if not wav_path.exists():
-            print(f"  [{i}] synthesizing: {text[:55]!r}…")
-            dur = synthesize_beat(text, wav_path)
+        wav = beats_dir / f"beat_{i:03d}.wav"
+        if args.force:
+            wav.unlink(missing_ok=True)
+        if not wav.exists():
+            print(f"  [{i}] synthesising: {text[:55]!r}…")
+            dur = synthesize(text, args.voice, wav)
         else:
-            dur = get_duration(wav_path)
-            print(f"  [{i}] cached ({dur:.1f}s)")
+            dur = wav_duration(wav)
+            print(f"  [{i}] cached  ({dur:.1f}s)")
 
-        beats.append({"index": i, "text": text, "start": cumulative, "end": cumulative + dur})
-        cumulative += dur + (SILENCE_MS / 1000)
-        beat_wavs.append(wav_path)
+        beats.append({"index": i, "text": text,
+                      "start": cumulative, "end": cumulative + dur})
+        cumulative += dur + SILENCE_MS / 1000.0
+        beat_wavs.append(wav)
 
-    # Concat narration
-    narration_wav = OUT_DIR / "narration.wav"
-    print(f"  concatenating → narration.wav")
-    total_dur = concat_wavs(beat_wavs, SILENCE_MS, narration_wav)
-    print(f"  total duration: {total_dur:.1f}s")
+    narration_wav = out_dir / "narration.wav"
+    total_dur     = concat_wavs(beat_wavs, SILENCE_MS, narration_wav)
+    print(f"  narration: {total_dur:.1f}s")
 
-    # Stage 2 — Visual cards per beat
-    print("\n▶ visuals")
+    # ── Visuals ───────────────────────────────────────────────────────────────
+    print("\n▶ visuals (animated gradient + text)")
     beat_videos = []
+
     for b in beats:
-        vid_path = beats_dir / f"beat_{b['index']:03d}.mp4"
-        if not vid_path.exists():
+        vid = beats_dir / f"beat_{b['index']:03d}.mp4"
+        if args.force:
+            vid.unlink(missing_ok=True)
+        if not vid.exists():
             dur = b["end"] - b["start"]
-            print(f"  [{b['index']}] rendering card ({dur:.1f}s)…")
-            make_beat_video(b["text"], dur, vid_path, b["index"])
+            print(f"  [{b['index']}] rendering ({dur:.1f}s)  {b['text'][:45]!r}…")
+            make_beat_video(b["text"], dur, style, b["index"], vid)
         else:
             print(f"  [{b['index']}] cached")
-        beat_videos.append(vid_path)
+        beat_videos.append(vid)
 
-    # Concat all beat videos
-    print("  concatenating video cards…")
-    silent_track = OUT_DIR / "silent_track.mp4"
+    silent_track = out_dir / "silent_track.mp4"
+    print("  concatenating beat clips…")
     concat_videos(beat_videos, silent_track)
 
-    # Stage 3 — Captions (ASS)
+    # ── Captions ──────────────────────────────────────────────────────────────
     print("\n▶ captions")
-    ass_path = OUT_DIR / "captions.ass"
-    ass_content = build_ass_captions(beats)
-    ass_path.write_text(ass_content, encoding="utf-8")
-    print(f"  captions.ass written ({len(beats)} beats)")
+    ass_path = out_dir / "captions.ass"
+    ass_path.write_text(build_ass(beats, style), encoding="utf-8")
+    print(f"  {ass_path} written")
 
-    # Stage 4 — Mux master.mp4
+    # ── Assemble master ───────────────────────────────────────────────────────
     print("\n▶ assemble")
-    master_path = OUT_DIR / "master.mp4"
-    mux_master(silent_track, narration_wav, ass_path, master_path)
-    size_mb = master_path.stat().st_size / 1e6
-    print(f"  master.mp4 → {master_path} ({size_mb:.1f} MB)")
+    master = out_dir / "master.mp4"
+    _run([
+        "ffmpeg", "-y",
+        "-i", str(silent_track),
+        "-i", str(narration_wav),
+        "-map", "0:v", "-map", "1:a",
+        "-vf", f"ass={ass_path}",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "17",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart",
+        "-shortest",
+        str(master),
+    ])
 
-    # Save manifest
+    size_mb = master.stat().st_size / 1e6
+    print(f"  ✅ master.mp4 → {master}  ({size_mb:.1f} MB, {total_dur:.0f}s)")
+
+    # ── Manifest ──────────────────────────────────────────────────────────────
     manifest = {
-        "beats": beats,
-        "total_duration": total_dur,
+        "style": style.get("name"),
+        "prompt": args.prompt,
+        "ref_url": args.ref_url,
+        "youtube_analysis": yt_analysis,
+        "voice": args.voice,
+        "total_duration": round(total_dur, 2),
         "resolution": f"{W}x{H}",
         "fps": FPS,
-        "style": "cinematic-dark-text-card",
+        "beats": beats,
     }
-    (OUT_DIR / "manifest.json").write_text(json.dumps(manifest, indent=2))
-
-    print(f"\n✅ Done! Output: {OUT_DIR}/")
-    print(f"   master.mp4  ({size_mb:.1f} MB, {total_dur:.0f}s)")
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    print(f"\n✅  Done → {out_dir}/")
 
 
 if __name__ == "__main__":
