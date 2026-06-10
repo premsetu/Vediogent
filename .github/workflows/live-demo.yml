@@ -23,12 +23,16 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install system dependencies
-        run: sudo apt-get install -y ffmpeg
-
       - name: Install Python dependencies
         run: |
           pip install flask gtts pydub pillow numpy static-ffmpeg requests edge-tts yt-dlp
+
+      - name: Pre-warm static FFmpeg (avoids apt libcaca0 404)
+        run: |
+          # Downloads the static ffmpeg/ffprobe binaries so the first request
+          # isn't slow. The app calls static_ffmpeg.add_paths() in-process, so
+          # the Flask worker + its ffmpeg subprocesses resolve the binary.
+          python -c "import static_ffmpeg; static_ffmpeg.add_paths(); import subprocess; print(subprocess.run(['ffmpeg','-version'],capture_output=True,text=True).stdout[:60])"
 
       - name: Install cloudflared
         run: |
