@@ -384,59 +384,175 @@ def render_frame(text: str, style: dict, beat_idx: int, out_path: Path) -> Path:
     return out_path
 
 
-# ── Beat video: animated bg + text overlay + fade ────────────────────────────
+def render_text_layer(text: str, style: dict, beat_idx: int, out_path: Path) -> Path:
+    """
+    Render a TRANSPARENT 1920x1080 RGBA layer containing only the text + shadow.
+    Overlaying this on the moving gradient keeps the background motion visible
+    (the old opaque-frame approach hid the animation behind a static card).
+    """
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+
+    try:
+        f84 = ImageFont.truetype(FONT_BOLD, 84)
+        f72 = ImageFont.truetype(FONT_BOLD, 72)
+        f60 = ImageFont.truetype(FONT_BOLD, 60)
+        f50 = ImageFont.truetype(FONT_BOLD, 50)
+    except Exception:
+        f84 = f72 = f60 = f50 = ImageFont.load_default()
+
+    is_punchy = len(text.split()) <= 10
+    max_chars = 28 if is_punchy else 40
+    lines = textwrap.wrap(text, width=max_chars)
+    if not lines:
+        layer.save(str(out_path))
+        return out_path
+
+    if len(lines) == 1:
+        font, lh = f84, 108
+    elif len(lines) <= 2:
+        font, lh = f72, 95
+    elif len(lines) <= 4:
+        font, lh = f60, 80
+    else:
+        font, lh = f50, 68
+
+    total_h = len(lines) * lh
+    y = max(90, (H - total_h) // 2 - 20)
+
+    # Accent rule above text on punchy non-opening beats
+    if beat_idx > 0 and is_punchy:
+        ax, aw = W // 2 - 50, 100
+        ac = style["accent"]
+        draw.rectangle([ax, y - 28, ax + aw, y - 23],
+                       fill=(ac[0], ac[1], ac[2], 255))
+
+    for i, line in enumerate(lines):
+        bbox = draw.textbbox((0, 0), line, font=font)
+        tw = bbox[2] - bbox[0]
+        x = (W - tw) // 2
+        # Layered drop shadow for legibility over moving bg
+        for ox, oy, a in [(6, 6, 200), (4, 4, 220), (2, 2, 255)]:
+            draw.text((x + ox, y + oy), line, font=font, fill=(0, 0, 0, a))
+        c = style["accent"] if (i == 0 and len(lines) == 1) else style["text"]
+        draw.text((x, y), line, font=font, fill=(c[0], c[1], c[2], 255))
+        y += lh
+
+    layer.save(str(out_path))
+    return out_path
+
+
+# ── Animation engine ─────────────────────────────────────────────────────────
+
+_INTENSITY = {"subtle": 0.5, "medium": 1.0, "strong": 1.9}
+
+
+def _bg_motion_filter(motion: str, duration: float, beat_idx: int, mult: float) -> str:
+    """
+    Build a zoompan-based filter chain turning input [0:v] (large gradient)
+    into [bg] at WxH with the requested camera motion.
+    """
+    n = int(duration * FPS) + 2
+    cx = "iw/2-(iw/zoom/2)"
+    cy = "ih/2-(ih/zoom/2)"
+
+    if motion == "static":
+        z, x, y = "1.001", cx, cy
+
+    elif motion == "zoom-in":
+        z = f"1.0+{0.13 * mult:.4f}*(on/{n})"
+        x, y = cx, cy
+
+    elif motion == "zoom-out":
+        z = f"{1.0 + 0.13 * mult:.4f}-{0.13 * mult:.4f}*(on/{n})"
+        x, y = cx, cy
+
+    elif motion == "pan":
+        z = "1.07"
+        amp = W * 0.05 * mult
+        x = f"iw/2-(iw/zoom/2)+{amp:.1f}*((on/{n})-0.5)*2"
+        y = cy
+
+    elif motion == "pulse":
+        amp = 0.045 * mult
+        z = f"1.05+{amp:.4f}*sin(6.2832*on/({FPS}*4))"
+        x, y = cx, cy
+
+    else:  # "drift" (default)
+        pz = 9 + (beat_idx % 3) * 2
+        px = 11 + (beat_idx % 4)
+        py = 8 + (beat_idx % 3)
+        az = (0.025 + 0.01 * (beat_idx % 3)) * mult
+        ax = (18 + 5 * (beat_idx % 3)) * mult
+        ay = (10 + 4 * (beat_idx % 3)) * mult
+        z = f"1.05+{az:.4f}*sin(6.2832*on/({FPS}*{pz}))"
+        x = f"iw/2-(iw/zoom/2)+{ax:.1f}*sin(6.2832*on/({FPS}*{px}))"
+        y = f"ih/2-(ih/zoom/2)+{ay:.1f}*sin(6.2832*on/({FPS}*{py}))"
+
+    return (f"[0:v]scale=2304:1296,format=yuv420p,"
+            f"zoompan=z='{z}':x='{x}':y='{y}':d={n}:s={W}x{H}:fps={FPS}[bg]")
+
+
+def _text_anim(text_anim: str, duration: float, fade_d: float, mult: float):
+    """
+    Return (filter_for_txt_label, overlay_xy) for the text layer animation.
+    The text layer input is [1:v]; output label [txt].
+    """
+    fade_out_s = max(0.1, duration - fade_d)
+    dist = int(90 * mult)
+
+    base_fade = (f"fade=t=in:st=0:d={fade_d}:alpha=1,"
+                 f"fade=t=out:st={fade_out_s}:d={fade_d}:alpha=1")
+    txt_filter = f"[1:v]scale={W}:{H},format=yuva420p,{base_fade}[txt]"
+
+    if text_anim == "slide-up":
+        xy = f"x=0:y='if(lt(t,{fade_d}),{dist}*(1-t/{fade_d}),0)'"
+    elif text_anim == "slide-down":
+        xy = f"x=0:y='if(lt(t,{fade_d}),-{dist}*(1-t/{fade_d}),0)'"
+    elif text_anim == "slide-left":
+        xy = f"y=0:x='if(lt(t,{fade_d}),{dist}*(1-t/{fade_d}),0)'"
+    elif text_anim == "slide-right":
+        xy = f"y=0:x='if(lt(t,{fade_d}),-{dist}*(1-t/{fade_d}),0)'"
+    else:  # "fade" / "none"
+        xy = "x=0:y=0"
+
+    return txt_filter, xy
+
 
 def make_beat_video(text: str, duration: float, style: dict,
-                    beat_idx: int, out_path: Path):
+                    beat_idx: int, out_path: Path, anim: dict = None):
     """
     Produce a video card for one beat:
-      • Large gradient BG → zoompan drift (cinematic floating feel)
-      • Text frame overlaid with fade-in / fade-out
+      • Large gradient BG → camera motion (bg_motion)
+      • Transparent text layer animated on top (text_anim)
+    anim = {text_anim, bg_motion, intensity}
     """
-    text_png  = out_path.with_name(out_path.stem + "_txt.png")
-    bg_png    = out_path.with_name(out_path.stem + "_bg.png")
+    anim = anim or {}
+    text_anim = anim.get("text_anim", "fade")
+    bg_motion = anim.get("bg_motion", "drift")
+    intensity = anim.get("intensity", "medium")
+    mult = _INTENSITY.get(intensity, 1.0)
 
-    # 1. Text frame (1920×1080)
-    render_frame(text, style, beat_idx, text_png)
+    text_png = out_path.with_name(out_path.stem + "_txt.png")
+    bg_png   = out_path.with_name(out_path.stem + "_bg.png")
 
-    # 2. Large gradient (2304×1296) — zoompan will drift inside it
-    bg_img = _make_gradient_img(style, seed=beat_idx)
-    bg_img.save(str(bg_png))
+    # 1. Transparent text layer (animation visible over moving bg)
+    render_text_layer(text, style, beat_idx, text_png)
 
-    fade_d     = max(0.3, min(0.45, duration * 0.12))
-    fade_out_s = max(0.1, duration - fade_d)
-    n_frames   = int(duration * FPS) + 5   # zoompan d= param
+    # 2. Large gradient for camera motion
+    _make_gradient_img(style, seed=beat_idx).save(str(bg_png))
 
-    # Slow sinusoidal drift parameters (vary by beat for variety)
-    period_z = 9  + (beat_idx % 3) * 2        # zoom period (s)
-    period_x = 11 + (beat_idx % 4)            # horizontal period
-    period_y = 8  + (beat_idx % 3)            # vertical period
-    amp_z    = 0.025 + 0.01 * (beat_idx % 3)
-    amp_x    = 18 + 5 * (beat_idx % 3)
-    amp_y    = 10 + 4 * (beat_idx % 3)
+    fade_d = max(0.3, min(0.5, duration * 0.14))
 
-    # zoompan expression (on = output frame number)
-    zp_z = f"1.05+{amp_z}*sin(6.2832*on/({FPS}*{period_z}))"
-    zp_x = f"iw/2-(iw/zoom/2)+{amp_x}*sin(6.2832*on/({FPS}*{period_x}))"
-    zp_y = f"ih/2-(ih/zoom/2)+{amp_y}*sin(6.2832*on/({FPS}*{period_y}))"
+    bg_fc = _bg_motion_filter(bg_motion, duration, beat_idx, mult)
+    txt_fc, overlay_xy = _text_anim(text_anim, duration, fade_d, mult)
 
-    # filter_complex:
-    #   [0] large bg  → zoompan drift  → [bg]
-    #   [1] text frame → fade in/out   → [txt]
-    #   [bg][txt]overlay → [out]
-    fc = (
-        f"[0:v]scale=2304:1296,format=yuv420p,"
-        f"zoompan=z='{zp_z}':x='{zp_x}':y='{zp_y}':d={n_frames}:s={W}x{H}:fps={FPS}[bg];"
-        f"[1:v]scale={W}:{H},format=yuva420p,"
-        f"fade=t=in:st=0:d={fade_d}:alpha=1,"
-        f"fade=t=out:st={fade_out_s}:d={fade_d}:alpha=1[txt];"
-        f"[bg][txt]overlay=0:0[out]"
-    )
+    fc = f"{bg_fc};{txt_fc};[bg][txt]overlay={overlay_xy}[out]"
 
     _run([
         "ffmpeg", "-y",
         "-loop", "1", "-i", str(bg_png),     # [0]: large bg
-        "-loop", "1", "-i", str(text_png),   # [1]: text
+        "-loop", "1", "-i", str(text_png),   # [1]: text layer
         "-t", str(duration),
         "-filter_complex", fc,
         "-map", "[out]",
@@ -448,6 +564,58 @@ def make_beat_video(text: str, duration: float, style: dict,
 
     text_png.unlink(missing_ok=True)
     bg_png.unlink(missing_ok=True)
+
+
+# ── Transitions between beats ─────────────────────────────────────────────────
+
+_XFADE_MAP = {
+    "fade": "fade", "dissolve": "dissolve",
+    "slide": "slideleft", "wipe": "wiperight", "smooth": "smoothleft",
+}
+
+
+def assemble_transitions(beat_videos: list, durations: list,
+                         transition: str, out: Path, overlap: float = 0.4):
+    """
+    Concatenate beat clips. If transition != 'none', cross-blend adjacent
+    clips with xfade. Beat clips are expected to be rendered slightly longer
+    (by `overlap`) on all but the last so the timeline stays aligned.
+    """
+    if transition == "none" or len(beat_videos) < 2:
+        concat_videos(beat_videos, out)
+        return
+
+    xf = _XFADE_MAP.get(transition, "fade")
+
+    inputs = []
+    for p in beat_videos:
+        inputs += ["-i", str(p)]
+
+    # Build xfade chain with cumulative offsets
+    chain = []
+    prev = "0:v"
+    cumulative = 0.0
+    for i in range(1, len(beat_videos)):
+        cumulative += durations[i - 1] - overlap
+        out_lbl = f"vx{i}"
+        chain.append(
+            f"[{prev}][{i}:v]xfade=transition={xf}:"
+            f"duration={overlap}:offset={cumulative:.3f}[{out_lbl}]"
+        )
+        prev = out_lbl
+
+    fc = ";".join(chain)
+
+    _run([
+        "ffmpeg", "-y",
+        *inputs,
+        "-filter_complex", fc,
+        "-map", f"[{prev}]",
+        "-r", str(FPS),
+        "-c:v", "libx264", "-preset", "fast", "-crf", "17",
+        "-pix_fmt", "yuv420p", "-an",
+        str(out),
+    ])
 
 
 # ── TTS ───────────────────────────────────────────────────────────────────────
@@ -579,6 +747,18 @@ def main():
                     help="TTS: edge:VoiceName  or  gtts:lang  (default: edge:en-US-GuyNeural)")
     ap.add_argument("--output",   default=f"out/video_{int(time.time())}",
                     help="Output directory")
+    ap.add_argument("--text-anim", dest="text_anim", default="fade",
+                    choices=["fade", "slide-up", "slide-down", "slide-left", "slide-right"],
+                    help="Text entrance animation")
+    ap.add_argument("--bg-motion", dest="bg_motion", default="drift",
+                    choices=["drift", "static", "zoom-in", "zoom-out", "pan", "pulse"],
+                    help="Background camera motion")
+    ap.add_argument("--intensity", default="medium",
+                    choices=["subtle", "medium", "strong"],
+                    help="Motion intensity")
+    ap.add_argument("--transition", default="none",
+                    choices=["none", "fade", "dissolve", "slide", "wipe", "smooth"],
+                    help="Transition between beats")
     ap.add_argument("--force",    action="store_true",
                     help="Regenerate all clips even if cached")
     args = ap.parse_args()
@@ -643,24 +823,35 @@ def main():
     print(f"  narration: {total_dur:.1f}s")
 
     # ── Visuals ───────────────────────────────────────────────────────────────
-    print("\n▶ visuals (animated gradient + text)")
+    anim = {"text_anim": args.text_anim, "bg_motion": args.bg_motion,
+            "intensity": args.intensity}
+    transition = args.transition
+    overlap = 0.4
+    print(f"\n▶ visuals  (text={args.text_anim}, bg={args.bg_motion}, "
+          f"intensity={args.intensity}, transition={transition})")
     beat_videos = []
+    render_durs = []
 
     for b in beats:
         vid = beats_dir / f"beat_{b['index']:03d}.mp4"
         if args.force:
             vid.unlink(missing_ok=True)
+        dur = b["end"] - b["start"]
+        # When transitions are on, extend non-last beats by the overlap so the
+        # xfade cross-blend doesn't shorten the timeline (keeps audio in sync).
+        if transition != "none" and b["index"] < len(beats) - 1:
+            dur += overlap
+        render_durs.append(dur)
         if not vid.exists():
-            dur = b["end"] - b["start"]
             print(f"  [{b['index']}] rendering ({dur:.1f}s)  {b['text'][:45]!r}…")
-            make_beat_video(b["text"], dur, style, b["index"], vid)
+            make_beat_video(b["text"], dur, style, b["index"], vid, anim)
         else:
             print(f"  [{b['index']}] cached")
         beat_videos.append(vid)
 
     silent_track = out_dir / "silent_track.mp4"
-    print("  concatenating beat clips…")
-    concat_videos(beat_videos, silent_track)
+    print(f"  assembling beat clips  (transition={transition})…")
+    assemble_transitions(beat_videos, render_durs, transition, silent_track, overlap)
 
     # ── Captions ──────────────────────────────────────────────────────────────
     print("\n▶ captions")

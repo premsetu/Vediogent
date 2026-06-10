@@ -330,6 +330,13 @@
 
     #btn-download:hover { background: rgba(124,92,252,.15); }
 
+    /* ── Animation grid ───────────────────────────────────────── */
+    .anim-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+
     /* ── Tooltip for voice ────────────────────────────────────── */
     .voice-note {
       font-size: 11px;
@@ -439,6 +446,49 @@ Supports inline directives:
       </p>
     </div>
 
+    <!-- Animation -->
+    <div class="card">
+      <div class="card-title">✨ Animation</div>
+
+      <div class="anim-grid">
+        <div class="field-group">
+          <label class="field-label">Text Animation</label>
+          <select id="text-anim">
+            {% for o in text_anim_options %}
+            <option value="{{ o.id }}">{{ o.label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+
+        <div class="field-group">
+          <label class="field-label">Background Motion</label>
+          <select id="bg-motion">
+            {% for o in bg_motion_options %}
+            <option value="{{ o.id }}">{{ o.label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+
+        <div class="field-group">
+          <label class="field-label">Beat Transition</label>
+          <select id="transition">
+            {% for o in transition_options %}
+            <option value="{{ o.id }}">{{ o.label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+
+        <div class="field-group">
+          <label class="field-label">Motion Intensity</label>
+          <select id="intensity">
+            {% for o in intensity_options %}
+            <option value="{{ o.id }}" {% if o.id == 'medium' %}selected{% endif %}>{{ o.label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+    </div>
+
     <!-- Advanced -->
     <div class="card">
       <div class="card-title">⚙ Advanced</div>
@@ -506,6 +556,10 @@ Supports inline directives:
       style_preset: getSelectedPreset(),
       ref_url:      document.getElementById('ref-url').value.trim(),
       voice:        document.getElementById('voice').value,
+      text_anim:    document.getElementById('text-anim').value,
+      bg_motion:    document.getElementById('bg-motion').value,
+      transition:   document.getElementById('transition').value,
+      intensity:    document.getElementById('intensity').value,
       output_name:  document.getElementById('output-name').value.trim(),
       force:        document.getElementById('force-regen').checked,
     };

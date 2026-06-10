@@ -15,7 +15,8 @@ import uuid
 from io import StringIO
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+REPO_ROOT = Path(__file__).parent.parent.resolve()
+sys.path.insert(0, str(REPO_ROOT))
 
 from flask import Flask, Response, jsonify, render_template, request, send_file
 
@@ -39,6 +40,38 @@ VOICE_OPTIONS = [
     {"id": "edge:en-US-JennyNeural", "label": "Edge — Jenny (US Female)"},
     {"id": "edge:en-GB-RyanNeural",  "label": "Edge — Ryan (UK Male)"},
     {"id": "edge:en-AU-WilliamNeural","label": "Edge — William (AU Male)"},
+]
+
+TEXT_ANIM_OPTIONS = [
+    {"id": "fade",        "label": "Fade In"},
+    {"id": "slide-up",    "label": "Slide Up"},
+    {"id": "slide-down",  "label": "Slide Down"},
+    {"id": "slide-left",  "label": "Slide Left"},
+    {"id": "slide-right", "label": "Slide Right"},
+]
+
+BG_MOTION_OPTIONS = [
+    {"id": "drift",    "label": "Drift (floating)"},
+    {"id": "zoom-in",  "label": "Zoom In"},
+    {"id": "zoom-out", "label": "Zoom Out"},
+    {"id": "pan",      "label": "Pan"},
+    {"id": "pulse",    "label": "Pulse"},
+    {"id": "static",   "label": "Static"},
+]
+
+TRANSITION_OPTIONS = [
+    {"id": "none",     "label": "Hard Cut"},
+    {"id": "fade",     "label": "Crossfade"},
+    {"id": "dissolve", "label": "Dissolve"},
+    {"id": "slide",    "label": "Slide"},
+    {"id": "wipe",     "label": "Wipe"},
+    {"id": "smooth",   "label": "Smooth Glide"},
+]
+
+INTENSITY_OPTIONS = [
+    {"id": "subtle", "label": "Subtle"},
+    {"id": "medium", "label": "Medium"},
+    {"id": "strong", "label": "Strong"},
 ]
 
 
@@ -78,7 +111,8 @@ def _run_generation(job_id: str, opts: dict):
     try:
         job["status"] = "running"
 
-        out_dir = Path("out") / f"job_{job_id[:8]}"
+        # Absolute output dir so Flask send_file can always locate the result
+        out_dir = REPO_ROOT / "out" / f"job_{job_id[:8]}"
         beats_dir = out_dir / "beats"
         out_dir.mkdir(parents=True, exist_ok=True)
         beats_dir.mkdir(exist_ok=True)
@@ -123,18 +157,31 @@ def _run_generation(job_id: str, opts: dict):
         total_dur     = mv.concat_wavs(beat_wavs, mv.SILENCE_MS, narration_wav)
         log.append(f"  narration: {total_dur:.1f}s")
 
-        # Visuals
-        log.append("▶ visuals")
+        # Visuals + animation
+        anim = {
+            "text_anim": opts.get("text_anim", "fade"),
+            "bg_motion": opts.get("bg_motion", "drift"),
+            "intensity": opts.get("intensity", "medium"),
+        }
+        transition = opts.get("transition", "none")
+        overlap = 0.4
+        log.append(f"▶ visuals  (text={anim['text_anim']}, bg={anim['bg_motion']}, "
+                   f"intensity={anim['intensity']}, transition={transition})")
         beat_videos = []
+        render_durs = []
         for b in beats:
             vid = beats_dir / f"beat_{b['index']:03d}.mp4"
             dur = b["end"] - b["start"]
+            if transition != "none" and b["index"] < len(beats) - 1:
+                dur += overlap
+            render_durs.append(dur)
             log.append(f"  [{b['index']}] rendering card ({dur:.1f}s)…")
-            mv.make_beat_video(b["text"], dur, style, b["index"], vid)
+            mv.make_beat_video(b["text"], dur, style, b["index"], vid, anim)
             beat_videos.append(vid)
 
         silent_track = out_dir / "silent_track.mp4"
-        mv.concat_videos(beat_videos, silent_track)
+        log.append(f"  assembling clips (transition={transition})…")
+        mv.assemble_transitions(beat_videos, render_durs, transition, silent_track, overlap)
 
         # Captions
         log.append("▶ captions")
@@ -175,11 +222,23 @@ def _run_generation(job_id: str, opts: dict):
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
+def _resolve(p: str) -> Path:
+    """Resolve a stored output path to an absolute path under the repo."""
+    path = Path(p)
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    return path
+
+
 @app.route("/")
 def index():
     return render_template("index.html",
                            style_presets=STYLE_PRESETS,
-                           voice_options=VOICE_OPTIONS)
+                           voice_options=VOICE_OPTIONS,
+                           text_anim_options=TEXT_ANIM_OPTIONS,
+                           bg_motion_options=BG_MOTION_OPTIONS,
+                           transition_options=TRANSITION_OPTIONS,
+                           intensity_options=INTENSITY_OPTIONS)
 
 
 @app.route("/generate", methods=["POST"])
@@ -223,11 +282,12 @@ def video(job_id):
     job = JOBS.get(job_id)
     if not job or not job.get("output_path"):
         return "Not found", 404
-    path = Path(job["output_path"])
+    path = _resolve(job["output_path"])
     if not path.exists():
         return "Video file missing", 404
     return send_file(str(path), mimetype="video/mp4",
-                     as_attachment=False, download_name="vediogent_output.mp4")
+                     as_attachment=False, conditional=True,
+                     download_name="vediogent_output.mp4")
 
 
 @app.route("/download/<job_id>")
@@ -235,7 +295,7 @@ def download(job_id):
     job = JOBS.get(job_id)
     if not job or not job.get("output_path"):
         return "Not found", 404
-    path = Path(job["output_path"])
+    path = _resolve(job["output_path"])
     if not path.exists():
         return "Video file missing", 404
     return send_file(str(path), mimetype="video/mp4",
