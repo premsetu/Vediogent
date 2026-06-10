@@ -1,0 +1,16 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+out/
+jobs/
+cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.wav
+*.mp4
+*.ass

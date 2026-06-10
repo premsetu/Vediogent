@@ -1,0 +1,20 @@
+# Core pipeline
+kokoro>=0.9.4
+soundfile>=0.12
+whisperx>=3.1
+torch>=2.1          # GPU recommended for WhisperX
+torchaudio>=2.1
+
+# Video / audio processing
+# FFmpeg must be installed separately (apt/brew): ffmpeg ffprobe yt-dlp
+
+# Optional TTS backends
+elevenlabs>=1.0     # only if using --voice elevenlabs:...
+openai>=1.30        # only if using --voice openai:... or LLM_BACKEND=openai
+
+# Optional LLM backend
+anthropic>=0.25     # only if LLM_BACKEND=claude
+
+# Utilities
+numpy>=1.24
+requests>=2.31
