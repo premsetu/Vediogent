@@ -1,0 +1,92 @@
+name: 🚀 Live Demo Server
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  serve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: claude/new-session-4xadlq
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependencies
+        run: sudo apt-get install -y ffmpeg
+
+      - name: Install Python dependencies
+        run: |
+          pip install flask gtts pydub pillow numpy static-ffmpeg requests edge-tts yt-dlp
+
+      - name: Install cloudflared
+        run: |
+          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+
+      - name: Start Flask server
+        run: |
+          python webapp/app.py &> /tmp/flask.log &
+          sleep 5
+          curl -s http://localhost:5000 | grep -q "Vediogent" && echo "✅ Flask is up" || echo "❌ Flask failed"
+          cat /tmp/flask.log | tail -5
+
+      - name: Start Cloudflare tunnel & publish URL
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          cloudflared tunnel --url http://localhost:5000 --no-autoupdate > /tmp/tunnel.log 2>&1 &
+
+          # Wait for tunnel URL (up to 30s)
+          URL=""
+          for i in $(seq 1 15); do
+            URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/tunnel.log 2>/dev/null | head -1)
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+
+          if [ -z "$URL" ]; then
+            echo "❌ Tunnel failed to start"
+            cat /tmp/tunnel.log
+            exit 1
+          fi
+
+          echo ""
+          echo "=================================================="
+          echo "  🎬 VEDIOGENT LIVE URL:"
+          echo "  $URL"
+          echo "=================================================="
+          echo ""
+
+          # Post URL as a GitHub issue so it's easy to find
+          curl -s -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/issues" \
+            -d "{
+              \"title\": \"🎬 Live Demo — Vediogent is running\",
+              \"body\": \"## Your Vediogent instance is live!\n\n### 👉 Open this link on your phone:\n\n# [$URL]($URL)\n\n---\n*Link stays active for ~25 minutes while the GitHub Action is running.*\n*Refresh this page if the link stops working — re-run the workflow to get a new one.*\"
+            }" > /tmp/issue.json
+
+          ISSUE_URL=$(python3 -c "import json,sys; d=json.load(open('/tmp/issue.json')); print(d.get('html_url','(no url)'))")
+          echo ""
+          echo "📌 Issue created: $ISSUE_URL"
+          echo ""
+
+          # Keep server alive for 25 minutes
+          echo "⏳ Server running — keeping alive for 25 minutes..."
+          sleep 1500
+          echo "⏹ Session ended."
