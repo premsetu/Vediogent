@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vediogent — AI Video Generator</title>
+  <style>
+    /* ── Reset & base ──────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:       #08080f;
+      --surface:  #101018;
+      --surface2: #16161f;
+      --border:   #2a2a3a;
+      --accent:   #7c5cfc;
+      --accent2:  #a07cff;
+      --text:     #e8e8f0;
+      --muted:    #7070a0;
+      --success:  #3dba7a;
+      --error:    #f05060;
+      --gold:     #d4a83a;
+      --radius:   12px;
+      --font:     'Inter', 'Segoe UI', system-ui, sans-serif;
+    }
+
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ─────────────────────────────────────────────── */
+    header {
+      padding: 20px 40px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+    }
+
+    .logo-icon {
+      width: 38px; height: 38px;
+      background: linear-gradient(135deg, var(--accent), #3a2880);
+      border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 20px;
+    }
+
+    .logo-text { font-size: 22px; font-weight: 700; letter-spacing: -0.5px; }
+    .logo-text span { color: var(--accent2); }
+
+    .header-tag {
+      margin-left: auto;
+      font-size: 11px;
+      color: var(--muted);
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      padding: 4px 10px;
+      border-radius: 20px;
+      letter-spacing: 0.5px;
+    }
+
+    /* ── Layout ──────────────────────────────────────────────── */
+    main {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 1fr 380px;
+      gap: 0;
+      max-width: 1440px;
+      width: 100%;
+      margin: 0 auto;
+    }
+
+    /* ── Left panel (script + generate) ─────────────────────── */
+    .panel-left {
+      padding: 32px 36px;
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }
+
+    .section-label {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 1px;
+      color: var(--muted);
+      text-transform: uppercase;
+      margin-bottom: 10px;
+    }
+
+    textarea#script {
+      width: 100%;
+      height: 360px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-size: 15px;
+      line-height: 1.65;
+      padding: 18px;
+      resize: vertical;
+      outline: none;
+      transition: border-color .2s;
+      font-family: 'Georgia', serif;
+    }
+
+    textarea#script:focus { border-color: var(--accent); }
+
+    /* Prompt row */
+    .prompt-row {
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+    }
+
+    .field-group { display: flex; flex-direction: column; flex: 1; }
+
+    label.field-label {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 7px;
+      font-weight: 500;
+    }
+
+    input[type="text"], input[type="url"], select {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 14px;
+      padding: 10px 14px;
+      outline: none;
+      transition: border-color .2s;
+      width: 100%;
+    }
+
+    input:focus, select:focus { border-color: var(--accent); }
+
+    select option { background: var(--surface2); }
+
+    /* ── Style cards ──────────────────────────────────────────── */
+    .style-grid {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 10px;
+    }
+
+    .style-card {
+      cursor: pointer;
+      border: 2px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 10px;
+      text-align: center;
+      transition: border-color .2s, background .2s;
+      user-select: none;
+    }
+
+    .style-card:hover { border-color: var(--accent2); }
+    .style-card.selected {
+      border-color: var(--accent);
+      background: rgba(124, 92, 252, .12);
+    }
+
+    .style-card .swatch {
+      width: 36px; height: 36px;
+      border-radius: 50%;
+      margin: 0 auto 8px;
+      border: 2px solid rgba(255,255,255,.15);
+    }
+
+    .style-card .s-label { font-size: 12px; font-weight: 600; }
+    .style-card .s-desc  { font-size: 10px; color: var(--muted); margin-top: 3px; line-height: 1.3; }
+
+    /* swatch colours per preset */
+    .sw-dark-epic      { background: radial-gradient(circle, #1c0e37 0%, #08080f 100%); }
+    .sw-dark-cinematic { background: radial-gradient(circle, #1a0c1c 0%, #050505 100%); }
+    .sw-blue-tech      { background: radial-gradient(circle, #00234b 0%, #040c1c 100%); }
+    .sw-warm-gold      { background: radial-gradient(circle, #231603 0%, #0a0703 100%); }
+    .sw-minimal-light  { background: radial-gradient(circle, #e8e8f5 0%, #f8f8f8 100%); }
+
+    /* ── Generate button ─────────────────────────────────────── */
+    #btn-generate {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      width: 100%;
+      padding: 16px;
+      background: linear-gradient(135deg, var(--accent), #3a2880);
+      border: none;
+      border-radius: var(--radius);
+      color: #fff;
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: 0.3px;
+      cursor: pointer;
+      transition: opacity .2s, transform .1s;
+    }
+
+    #btn-generate:hover  { opacity: .88; }
+    #btn-generate:active { transform: scale(.98); }
+    #btn-generate:disabled { opacity: .45; cursor: not-allowed; }
+
+    .btn-icon { font-size: 18px; }
+
+    /* ── Right panel (options + output) ───────────────────────── */
+    .panel-right {
+      padding: 32px 28px;
+      display: flex;
+      flex-direction: column;
+      gap: 28px;
+      overflow-y: auto;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+    }
+
+    .card-title {
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: .5px;
+      color: var(--accent2);
+      margin-bottom: 16px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    /* ── Progress / output ───────────────────────────────────── */
+    #output-section { display: none; }
+
+    #progress-log {
+      background: #0a0a12;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px;
+      font-family: 'Fira Code', 'Courier New', monospace;
+      font-size: 12px;
+      line-height: 1.7;
+      color: #90a0b0;
+      max-height: 280px;
+      overflow-y: auto;
+    }
+
+    #progress-log .line-done    { color: #3dba7a; }
+    #progress-log .line-stage   { color: var(--accent2); font-weight: 700; }
+    #progress-log .line-warn    { color: var(--gold); }
+    #progress-log .line-error   { color: var(--error); }
+    #progress-log .line-default { color: #90a0b0; }
+
+    /* Status badge */
+    #status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 4px 12px;
+      border-radius: 20px;
+      margin-bottom: 12px;
+    }
+
+    .badge-running { background: rgba(124,92,252,.2); color: var(--accent2); }
+    .badge-done    { background: rgba(61,186,122,.2); color: var(--success); }
+    .badge-error   { background: rgba(240,80,96,.2);  color: var(--error);   }
+    .badge-queued  { background: rgba(112,112,160,.2); color: var(--muted); }
+
+    /* Spinner */
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner {
+      width: 12px; height: 12px;
+      border: 2px solid rgba(255,255,255,.2);
+      border-top-color: var(--accent2);
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+    }
+
+    /* Video player */
+    #video-output {
+      display: none;
+      margin-top: 16px;
+    }
+
+    #video-output video {
+      width: 100%;
+      border-radius: 10px;
+      background: #000;
+      border: 1px solid var(--border);
+    }
+
+    .output-meta {
+      display: flex;
+      gap: 16px;
+      margin-top: 10px;
+    }
+
+    .meta-chip {
+      font-size: 12px;
+      color: var(--muted);
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 3px 10px;
+    }
+
+    #btn-download {
+      display: none;
+      margin-top: 12px;
+      width: 100%;
+      padding: 12px;
+      background: var(--surface2);
+      border: 1px solid var(--accent);
+      border-radius: var(--radius);
+      color: var(--accent2);
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background .2s;
+    }
+
+    #btn-download:hover { background: rgba(124,92,252,.15); }
+
+    /* ── Tooltip for voice ────────────────────────────────────── */
+    .voice-note {
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 6px;
+      line-height: 1.4;
+    }
+
+    /* ── Responsive ──────────────────────────────────────────── */
+    @media (max-width: 900px) {
+      main { grid-template-columns: 1fr; }
+      .panel-left { border-right: none; border-bottom: 1px solid var(--border); }
+      .style-grid { grid-template-columns: repeat(3, 1fr); }
+    }
+  </style>
+</head>
+<body>
+
+<!-- Header -->
+<header>
+  <div class="logo-icon">🎬</div>
+  <div class="logo-text">Vedi<span>ogent</span></div>
+  <div class="header-tag">AI VIDEO GENERATOR</div>
+</header>
+
+<main>
+
+  <!-- ── Left panel ─────────────────────────────────────────── -->
+  <div class="panel-left">
+
+    <!-- Script -->
+    <div>
+      <div class="section-label">Your Script</div>
+      <textarea id="script" placeholder="Paste your script here…
+
+Each paragraph separated by a blank line becomes one video beat.
+
+Supports inline directives:
+  [[visual: keyword]]   — stock search term
+  [[hold: 4.5]]         — hold this beat N seconds
+  [[image: url]]        — pin a specific image"></textarea>
+    </div>
+
+    <!-- Prompt -->
+    <div>
+      <div class="section-label">Style Prompt</div>
+      <input type="text" id="prompt"
+             value="dark epic cinematic"
+             placeholder="e.g. dark cinematic, energetic, minimal clean, warm luxury…" />
+    </div>
+
+    <!-- Visual Style -->
+    <div>
+      <div class="section-label">Visual Style Preset</div>
+      <div class="style-grid">
+        {% for p in style_presets %}
+        <div class="style-card {% if loop.first %}selected{% endif %}"
+             data-preset="{{ p.id }}"
+             onclick="selectStyle(this)">
+          <div class="swatch sw-{{ p.id }}"></div>
+          <div class="s-label">{{ p.label }}</div>
+          <div class="s-desc">{{ p.desc }}</div>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+
+    <!-- Generate -->
+    <button id="btn-generate" onclick="generate()">
+      <span class="btn-icon">▶</span>
+      Generate Video
+    </button>
+
+  </div><!-- /panel-left -->
+
+  <!-- ── Right panel ────────────────────────────────────────── -->
+  <div class="panel-right">
+
+    <!-- YouTube Reference -->
+    <div class="card">
+      <div class="card-title">🔗 YouTube Reference</div>
+      <div class="field-group">
+        <label class="field-label">Paste a YouTube URL to replicate its style & pacing</label>
+        <input type="url" id="ref-url"
+               placeholder="https://youtu.be/VIDEO_ID or https://youtube.com/watch?v=…" />
+      </div>
+      <p style="font-size:11px;color:var(--muted);margin-top:10px;line-height:1.5">
+        Vediogent downloads the transcript + thumbnail, analyses colour palette &amp; cut pacing,
+        and applies that to your video automatically.
+      </p>
+    </div>
+
+    <!-- Voice -->
+    <div class="card">
+      <div class="card-title">🎙 Voice</div>
+      <div class="field-group">
+        <label class="field-label">TTS Engine &amp; Voice</label>
+        <select id="voice">
+          {% for v in voice_options %}
+          <option value="{{ v.id }}">{{ v.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <p class="voice-note">
+        Edge voices require network access to Microsoft servers.
+        Google TTS always works as fallback.
+      </p>
+    </div>
+
+    <!-- Advanced -->
+    <div class="card">
+      <div class="card-title">⚙ Advanced</div>
+
+      <div class="field-group" style="margin-bottom:14px">
+        <label class="field-label">Output folder name (optional)</label>
+        <input type="text" id="output-name" placeholder="my_channel_intro" />
+      </div>
+
+      <div style="display:flex;gap:10px">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;color:var(--muted)">
+          <input type="checkbox" id="force-regen"
+                 style="accent-color:var(--accent);width:15px;height:15px" />
+          Force regenerate all clips
+        </label>
+      </div>
+    </div>
+
+    <!-- Output -->
+    <div id="output-section" class="card">
+      <div class="card-title">🎞 Output</div>
+      <div id="status-badge" class="badge-queued">
+        <div class="spinner"></div> Queued
+      </div>
+      <div id="progress-log"></div>
+      <div id="video-output">
+        <video id="video-player" controls></video>
+        <div class="output-meta">
+          <span class="meta-chip" id="meta-size"></span>
+          <span class="meta-chip" id="meta-dur"></span>
+          <span class="meta-chip">1920 × 1080</span>
+        </div>
+      </div>
+      <button id="btn-download" onclick="downloadVideo()">⬇ Download MP4</button>
+    </div>
+
+  </div><!-- /panel-right -->
+
+</main>
+
+<script>
+  let currentJobId = null;
+  let pollTimer    = null;
+
+  function selectStyle(card) {
+    document.querySelectorAll('.style-card').forEach(c => c.classList.remove('selected'));
+    card.classList.add('selected');
+  }
+
+  function getSelectedPreset() {
+    const sel = document.querySelector('.style-card.selected');
+    return sel ? sel.dataset.preset : 'dark-epic';
+  }
+
+  async function generate() {
+    const script = document.getElementById('script').value.trim();
+    if (!script) {
+      alert('Please enter your script first.');
+      return;
+    }
+
+    const payload = {
+      script:       script,
+      prompt:       document.getElementById('prompt').value,
+      style_preset: getSelectedPreset(),
+      ref_url:      document.getElementById('ref-url').value.trim(),
+      voice:        document.getElementById('voice').value,
+      output_name:  document.getElementById('output-name').value.trim(),
+      force:        document.getElementById('force-regen').checked,
+    };
+
+    // UI: disable button, show output section
+    const btn = document.getElementById('btn-generate');
+    btn.disabled = true;
+    btn.innerHTML = '<div class="spinner" style="border-top-color:#fff"></div> Generating…';
+
+    document.getElementById('output-section').style.display = 'block';
+    document.getElementById('video-output').style.display   = 'none';
+    document.getElementById('btn-download').style.display   = 'none';
+    document.getElementById('progress-log').innerHTML = '';
+    setStatusBadge('running', 'Generating…');
+
+    // Scroll to output
+    document.getElementById('output-section').scrollIntoView({ behavior: 'smooth' });
+
+    try {
+      const res  = await fetch('/generate', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (data.error) { showError(data.error); return; }
+
+      currentJobId = data.job_id;
+      pollStatus();
+    } catch (e) {
+      showError('Network error: ' + e.message);
+    }
+  }
+
+  function pollStatus() {
+    clearTimeout(pollTimer);
+    pollTimer = setTimeout(async () => {
+      try {
+        const res  = await fetch('/status/' + currentJobId);
+        const data = await res.json();
+        renderLog(data.log || []);
+
+        if (data.status === 'running' || data.status === 'queued') {
+          setStatusBadge(data.status === 'queued' ? 'queued' : 'running',
+                         data.status === 'queued' ? 'Queued' : 'Generating…');
+          pollTimer = setTimeout(pollStatus, 2000);
+
+        } else if (data.status === 'done') {
+          setStatusBadge('done', '✓ Complete');
+          showVideo(data);
+          resetButton();
+
+        } else {
+          setStatusBadge('error', '✗ Error');
+          resetButton();
+        }
+      } catch (e) {
+        console.error(e);
+        pollTimer = setTimeout(pollStatus, 3000);
+      }
+    }, 1500);
+  }
+
+  function renderLog(lines) {
+    const el = document.getElementById('progress-log');
+    el.innerHTML = lines.map(l => {
+      let cls = 'line-default';
+      if (l.startsWith('✅') || l.startsWith('  ✅')) cls = 'line-done';
+      else if (l.startsWith('▶'))                     cls = 'line-stage';
+      else if (l.includes('[warn]'))                  cls = 'line-warn';
+      else if (l.startsWith('❌') || l.includes('Error')) cls = 'line-error';
+      return `<div class="${cls}">${escHtml(l)}</div>`;
+    }).join('');
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function showVideo(data) {
+    const player = document.getElementById('video-player');
+    player.src   = '/video/' + currentJobId + '?t=' + Date.now();
+    document.getElementById('video-output').style.display  = 'block';
+    document.getElementById('btn-download').style.display  = 'block';
+    document.getElementById('meta-size').textContent = (data.size_mb || '?') + ' MB';
+    document.getElementById('meta-dur').textContent  = formatDur(data.duration);
+  }
+
+  function downloadVideo() {
+    window.location = '/download/' + currentJobId;
+  }
+
+  function setStatusBadge(type, text) {
+    const el = document.getElementById('status-badge');
+    el.className = 'badge-' + type;
+    const hasSpinner = type === 'running' || type === 'queued';
+    el.innerHTML = (hasSpinner ? '<div class="spinner"></div> ' : '') + text;
+  }
+
+  function resetButton() {
+    const btn = document.getElementById('btn-generate');
+    btn.disabled = false;
+    btn.innerHTML = '<span class="btn-icon">▶</span> Generate Video';
+  }
+
+  function showError(msg) {
+    setStatusBadge('error', '✗ ' + msg);
+    resetButton();
+  }
+
+  function formatDur(secs) {
+    if (!secs) return '';
+    const m = Math.floor(secs / 60);
+    const s = Math.round(secs % 60);
+    return `${m}:${String(s).padStart(2, '0')}`;
+  }
+
+  function escHtml(s) {
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+</script>
+
+</body>
+</html>
