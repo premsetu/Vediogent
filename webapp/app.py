@@ -164,9 +164,13 @@ def _run_generation(job_id: str, opts: dict):
             "intensity": opts.get("intensity", "medium"),
         }
         transition = opts.get("transition", "none")
+        pexels_key = opts.get("pexels_key", "").strip() or None
+        cache_dir  = REPO_ROOT / "cache"
+        cache_dir.mkdir(exist_ok=True)
         overlap = 0.4
         log.append(f"▶ visuals  (text={anim['text_anim']}, bg={anim['bg_motion']}, "
-                   f"intensity={anim['intensity']}, transition={transition})")
+                   f"intensity={anim['intensity']}, transition={transition}"
+                   + (", pexels=yes" if pexels_key else "") + ")")
         beat_videos = []
         render_durs = []
         for b in beats:
@@ -176,7 +180,8 @@ def _run_generation(job_id: str, opts: dict):
                 dur += overlap
             render_durs.append(dur)
             log.append(f"  [{b['index']}] rendering card ({dur:.1f}s)…")
-            mv.make_beat_video(b["text"], dur, style, b["index"], vid, anim)
+            mv.make_beat_video(b["text"], dur, style, b["index"], vid, anim,
+                               pexels_key=pexels_key, cache_dir=cache_dir)
             beat_videos.append(vid)
 
         silent_track = out_dir / "silent_track.mp4"

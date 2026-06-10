@@ -54,6 +54,20 @@ FPS  = 30
 FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 SILENCE_MS = 180
 
+_PEXELS_VIDEO_URL = "https://api.pexels.com/videos/search"
+_PEXELS_PHOTO_URL = "https://api.pexels.com/v1/search"
+
+_STOP_WORDS = frozenset([
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "as", "is", "was", "are", "were", "be",
+    "been", "have", "has", "had", "do", "does", "did", "will", "would",
+    "could", "should", "may", "might", "it", "its", "this", "that", "you",
+    "your", "we", "our", "i", "my", "he", "she", "they", "their", "not",
+    "no", "so", "if", "then", "when", "what", "how", "who", "just", "very",
+    "more", "like", "even", "back", "only", "can", "all", "some", "one",
+    "two", "also", "than", "into", "much", "about", "every", "each",
+])
+
 # ── Visual style presets ──────────────────────────────────────────────────────
 STYLES = {
     "dark-epic": {
@@ -386,9 +400,8 @@ def render_frame(text: str, style: dict, beat_idx: int, out_path: Path) -> Path:
 
 def render_text_layer(text: str, style: dict, beat_idx: int, out_path: Path) -> Path:
     """
-    Render a TRANSPARENT 1920x1080 RGBA layer containing only the text + shadow.
-    Overlaying this on the moving gradient keeps the background motion visible
-    (the old opaque-frame approach hid the animation behind a static card).
+    Render a TRANSPARENT 1920x1080 RGBA layer with text + blurred dark scrim.
+    The scrim ensures legibility over both gradient and real stock footage backgrounds.
     """
     layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(layer)
@@ -418,20 +431,41 @@ def render_text_layer(text: str, style: dict, beat_idx: int, out_path: Path) -> 
         font, lh = f50, 68
 
     total_h = len(lines) * lh
-    y = max(90, (H - total_h) // 2 - 20)
+    y_start = max(90, (H - total_h) // 2 - 20)
+
+    # Measure max line width so the scrim is sized correctly
+    max_tw = 0
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font)
+        max_tw = max(max_tw, bbox[2] - bbox[0])
+
+    # Blurred dark scrim — makes text readable over stock footage
+    pad = 40
+    extra_top = 35 if (beat_idx > 0 and is_punchy) else 0
+    scrim = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(scrim)
+    sd.rectangle([
+        max(0, W // 2 - max_tw // 2 - pad),
+        max(0, y_start - pad - extra_top),
+        min(W, W // 2 + max_tw // 2 + pad),
+        min(H, y_start + total_h + pad),
+    ], fill=(0, 0, 0, 155))
+    scrim = scrim.filter(ImageFilter.GaussianBlur(28))
+    layer = Image.alpha_composite(scrim, layer)
+    draw = ImageDraw.Draw(layer)
 
     # Accent rule above text on punchy non-opening beats
     if beat_idx > 0 and is_punchy:
         ax, aw = W // 2 - 50, 100
         ac = style["accent"]
-        draw.rectangle([ax, y - 28, ax + aw, y - 23],
+        draw.rectangle([ax, y_start - 28, ax + aw, y_start - 23],
                        fill=(ac[0], ac[1], ac[2], 255))
 
+    y = y_start
     for i, line in enumerate(lines):
         bbox = draw.textbbox((0, 0), line, font=font)
         tw = bbox[2] - bbox[0]
         x = (W - tw) // 2
-        # Layered drop shadow for legibility over moving bg
         for ox, oy, a in [(6, 6, 200), (4, 4, 220), (2, 2, 255)]:
             draw.text((x + ox, y + oy), line, font=font, fill=(0, 0, 0, a))
         c = style["accent"] if (i == 0 and len(lines) == 1) else style["text"]
@@ -440,6 +474,147 @@ def render_text_layer(text: str, style: dict, beat_idx: int, out_path: Path) -> 
 
     layer.save(str(out_path))
     return out_path
+
+
+# ── Pexels stock footage ──────────────────────────────────────────────────────
+
+def _beat_keywords(text: str) -> str:
+    """Extract 1-3 visual search keywords from beat text (no LLM needed)."""
+    words = re.findall(r"\b[a-zA-Z]{4,}\b", text.lower())
+    keywords = [w for w in words if w not in _STOP_WORDS][:3]
+    return " ".join(keywords) if keywords else " ".join(text.split()[:3])
+
+
+def _pexels_video_url(keyword: str, api_key: str) -> Optional[str]:
+    req = urllib.request.Request(
+        f"{_PEXELS_VIDEO_URL}?query={urllib.parse.quote(keyword)}&per_page=10&orientation=landscape",
+        headers={"Authorization": api_key},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read())
+        for video in data.get("videos", []):
+            for vf in sorted(video.get("video_files", []),
+                             key=lambda x: x.get("width", 0), reverse=True):
+                if vf.get("width", 0) >= 1280:
+                    return vf["link"]
+    except Exception as e:
+        print(f"  [warn] Pexels video search failed: {e}")
+    return None
+
+
+def _pexels_photo_url(keyword: str, api_key: str) -> Optional[str]:
+    req = urllib.request.Request(
+        f"{_PEXELS_PHOTO_URL}?query={urllib.parse.quote(keyword)}&per_page=5",
+        headers={"Authorization": api_key},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read())
+        photos = data.get("photos", [])
+        if photos:
+            return photos[0]["src"]["large2x"]
+    except Exception as e:
+        print(f"  [warn] Pexels photo search failed: {e}")
+    return None
+
+
+def _get_pexels_bg(keyword: str, cache_dir: Path, api_key: str) -> Optional[Path]:
+    """Download & cache Pexels stock video/photo. Returns local path or None."""
+    pexels_cache = cache_dir / "pexels_cache"
+    pexels_cache.mkdir(parents=True, exist_ok=True)
+    safe_kw = re.sub(r"[^a-z0-9]", "_", keyword.lower())[:40]
+
+    cached_video = pexels_cache / f"{safe_kw}_v.mp4"
+    if not cached_video.exists():
+        url = _pexels_video_url(keyword, api_key)
+        if url:
+            print(f"  [pexels] ↓ video: {keyword!r}")
+            try:
+                urllib.request.urlretrieve(url, str(cached_video))
+            except Exception as e:
+                print(f"  [warn] Pexels video download failed: {e}")
+                cached_video.unlink(missing_ok=True)
+    if cached_video.exists():
+        return cached_video
+
+    cached_photo = pexels_cache / f"{safe_kw}_p.jpg"
+    if not cached_photo.exists():
+        url = _pexels_photo_url(keyword, api_key)
+        if url:
+            print(f"  [pexels] ↓ photo: {keyword!r}")
+            try:
+                urllib.request.urlretrieve(url, str(cached_photo))
+            except Exception as e:
+                print(f"  [warn] Pexels photo download failed: {e}")
+                cached_photo.unlink(missing_ok=True)
+    if cached_photo.exists():
+        return cached_photo
+
+    return None
+
+
+def _is_image(path: Path) -> bool:
+    return path.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+
+
+def _color_grade_filter(style: dict) -> str:
+    """FFmpeg eq filter for style-matched color grading of stock footage."""
+    bg = style.get("bg", (5, 5, 15))
+    brightness = sum(bg) / (3 * 255)
+    if brightness < 0.08:
+        return "eq=brightness=-0.12:contrast=1.2:saturation=1.15"
+    elif brightness < 0.20:
+        return "eq=brightness=-0.07:contrast=1.1:saturation=1.1"
+    else:
+        return "eq=brightness=0.03:contrast=1.05:saturation=0.9"
+
+
+def _make_from_stock(stock_path: Path, text_png: Path, duration: float,
+                     style: dict, bg_motion: str, mult: float,
+                     txt_fc: str, overlay_xy: str, out_path: Path):
+    """Render a beat clip using real stock footage/photo as the background."""
+    is_img = _is_image(stock_path)
+    n = int(duration * FPS) + 2
+    grade = _color_grade_filter(style)
+
+    if is_img:
+        # Ken Burns zoom for still photos — same animated motion as gradient path
+        az = 0.025 * mult
+        ax = 15.0 * mult
+        ay = 9.0 * mult
+        z_expr = f"1.05+{az:.4f}*sin(6.2832*on/({FPS}*9))"
+        x_expr = f"iw/2-(iw/zoom/2)+{ax:.1f}*sin(6.2832*on/({FPS}*11))"
+        y_expr = f"ih/2-(ih/zoom/2)+{ay:.1f}*sin(6.2832*on/({FPS}*8))"
+        bg_fc = (
+            f"[0:v]scale=2304:1296:force_original_aspect_ratio=increase,"
+            f"crop=2304:1296,setsar=1,format=yuv420p,"
+            f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':d={n}:s={W}x{H}:fps={FPS},"
+            f"{grade}[bg]"
+        )
+        loop_flags = ["-loop", "1"]
+    else:
+        # Video: scale to fill frame, let the footage's own motion speak
+        bg_fc = (
+            f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
+            f"crop={W}:{H},setsar=1,format=yuv420p,{grade}[bg]"
+        )
+        loop_flags = ["-stream_loop", "-1"]
+
+    fc = f"{bg_fc};{txt_fc};[bg][txt]overlay={overlay_xy}[out]"
+
+    _run([
+        "ffmpeg", "-y",
+        *loop_flags, "-i", str(stock_path),
+        "-loop", "1", "-i", str(text_png),
+        "-t", str(duration),
+        "-filter_complex", fc,
+        "-map", "[out]",
+        "-r", str(FPS), "-t", str(duration),
+        "-c:v", "libx264", "-preset", "fast", "-crf", "17",
+        "-pix_fmt", "yuv420p", "-an",
+        str(out_path),
+    ])
 
 
 # ── Animation engine ─────────────────────────────────────────────────────────
@@ -520,50 +695,59 @@ def _text_anim(text_anim: str, duration: float, fade_d: float, mult: float):
 
 
 def make_beat_video(text: str, duration: float, style: dict,
-                    beat_idx: int, out_path: Path, anim: dict = None):
+                    beat_idx: int, out_path: Path, anim: dict = None,
+                    pexels_key: str = None, cache_dir: Path = None):
     """
-    Produce a video card for one beat:
-      • Large gradient BG → camera motion (bg_motion)
-      • Transparent text layer animated on top (text_anim)
+    Produce a video card for one beat.
+    If pexels_key is provided, fetches matching stock footage from Pexels.
+    Falls back to animated gradient when no key or no footage is found.
     anim = {text_anim, bg_motion, intensity}
     """
     anim = anim or {}
     text_anim = anim.get("text_anim", "fade")
-    bg_motion = anim.get("bg_motion", "drift")
-    intensity = anim.get("intensity", "medium")
+    bg_motion  = anim.get("bg_motion", "drift")
+    intensity  = anim.get("intensity", "medium")
     mult = _INTENSITY.get(intensity, 1.0)
 
     text_png = out_path.with_name(out_path.stem + "_txt.png")
-    bg_png   = out_path.with_name(out_path.stem + "_bg.png")
-
-    # 1. Transparent text layer (animation visible over moving bg)
     render_text_layer(text, style, beat_idx, text_png)
 
-    # 2. Large gradient for camera motion
-    _make_gradient_img(style, seed=beat_idx).save(str(bg_png))
-
     fade_d = max(0.3, min(0.5, duration * 0.14))
-
-    bg_fc = _bg_motion_filter(bg_motion, duration, beat_idx, mult)
     txt_fc, overlay_xy = _text_anim(text_anim, duration, fade_d, mult)
 
-    fc = f"{bg_fc};{txt_fc};[bg][txt]overlay={overlay_xy}[out]"
+    # Try Pexels stock footage background
+    stock = None
+    if pexels_key:
+        keyword = _beat_keywords(text)
+        cd = cache_dir or out_path.parent
+        stock = _get_pexels_bg(keyword, cd, pexels_key)
+        if stock:
+            print(f"  [{beat_idx}] stock bg: {stock.name!r} ({keyword!r})")
 
-    _run([
-        "ffmpeg", "-y",
-        "-loop", "1", "-i", str(bg_png),     # [0]: large bg
-        "-loop", "1", "-i", str(text_png),   # [1]: text layer
-        "-t", str(duration),
-        "-filter_complex", fc,
-        "-map", "[out]",
-        "-r", str(FPS), "-t", str(duration),
-        "-c:v", "libx264", "-preset", "fast", "-crf", "17",
-        "-pix_fmt", "yuv420p", "-an",
-        str(out_path),
-    ])
+    if stock:
+        _make_from_stock(stock, text_png, duration, style, bg_motion, mult,
+                         txt_fc, overlay_xy, out_path)
+    else:
+        # Animated gradient fallback
+        bg_png = out_path.with_name(out_path.stem + "_bg.png")
+        _make_gradient_img(style, seed=beat_idx).save(str(bg_png))
+        bg_fc = _bg_motion_filter(bg_motion, duration, beat_idx, mult)
+        fc = f"{bg_fc};{txt_fc};[bg][txt]overlay={overlay_xy}[out]"
+        _run([
+            "ffmpeg", "-y",
+            "-loop", "1", "-i", str(bg_png),
+            "-loop", "1", "-i", str(text_png),
+            "-t", str(duration),
+            "-filter_complex", fc,
+            "-map", "[out]",
+            "-r", str(FPS), "-t", str(duration),
+            "-c:v", "libx264", "-preset", "fast", "-crf", "17",
+            "-pix_fmt", "yuv420p", "-an",
+            str(out_path),
+        ])
+        bg_png.unlink(missing_ok=True)
 
     text_png.unlink(missing_ok=True)
-    bg_png.unlink(missing_ok=True)
 
 
 # ── Transitions between beats ─────────────────────────────────────────────────
@@ -759,8 +943,10 @@ def main():
     ap.add_argument("--transition", default="none",
                     choices=["none", "fade", "dissolve", "slide", "wipe", "smooth"],
                     help="Transition between beats")
-    ap.add_argument("--force",    action="store_true",
+    ap.add_argument("--force",      action="store_true",
                     help="Regenerate all clips even if cached")
+    ap.add_argument("--pexels-key", dest="pexels_key", default="",
+                    help="Pexels API key — enables real stock footage backgrounds")
     args = ap.parse_args()
 
     # ── Read script ───────────────────────────────────────────────────────────
@@ -825,10 +1011,14 @@ def main():
     # ── Visuals ───────────────────────────────────────────────────────────────
     anim = {"text_anim": args.text_anim, "bg_motion": args.bg_motion,
             "intensity": args.intensity}
-    transition = args.transition
-    overlap = 0.4
+    transition  = args.transition
+    pexels_key  = args.pexels_key.strip() or None
+    overlap     = 0.4
+    cache_dir   = out_dir / "cache"
+
     print(f"\n▶ visuals  (text={args.text_anim}, bg={args.bg_motion}, "
-          f"intensity={args.intensity}, transition={transition})")
+          f"intensity={args.intensity}, transition={transition}"
+          + (", pexels=yes" if pexels_key else "") + ")")
     beat_videos = []
     render_durs = []
 
@@ -837,14 +1027,13 @@ def main():
         if args.force:
             vid.unlink(missing_ok=True)
         dur = b["end"] - b["start"]
-        # When transitions are on, extend non-last beats by the overlap so the
-        # xfade cross-blend doesn't shorten the timeline (keeps audio in sync).
         if transition != "none" and b["index"] < len(beats) - 1:
             dur += overlap
         render_durs.append(dur)
         if not vid.exists():
             print(f"  [{b['index']}] rendering ({dur:.1f}s)  {b['text'][:45]!r}…")
-            make_beat_video(b["text"], dur, style, b["index"], vid, anim)
+            make_beat_video(b["text"], dur, style, b["index"], vid, anim,
+                            pexels_key=pexels_key, cache_dir=cache_dir)
         else:
             print(f"  [{b['index']}] cached")
         beat_videos.append(vid)

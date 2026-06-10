@@ -489,6 +489,24 @@ Supports inline directives:
       </div>
     </div>
 
+    <!-- Stock Footage -->
+    <div class="card">
+      <div class="card-title">🎥 Stock Footage</div>
+      <div class="field-group" style="margin-bottom:10px">
+        <label class="field-label">Pexels API Key (optional)</label>
+        <input type="text" id="pexels-key"
+               placeholder="Paste your free Pexels API key here…"
+               autocomplete="off" />
+      </div>
+      <p style="font-size:11px;color:var(--muted);line-height:1.5">
+        When provided, each beat uses real matching stock footage from
+        <strong style="color:var(--text)">Pexels</strong> instead of the gradient.
+        Get a free key at
+        <a href="https://www.pexels.com/api/" target="_blank"
+           style="color:var(--accent2)">pexels.com/api</a>.
+      </p>
+    </div>
+
     <!-- Advanced -->
     <div class="card">
       <div class="card-title">⚙ Advanced</div>
@@ -560,6 +578,7 @@ Supports inline directives:
       bg_motion:    document.getElementById('bg-motion').value,
       transition:   document.getElementById('transition').value,
       intensity:    document.getElementById('intensity').value,
+      pexels_key:   document.getElementById('pexels-key').value.trim(),
       output_name:  document.getElementById('output-name').value.trim(),
       force:        document.getElementById('force-regen').checked,
     };
